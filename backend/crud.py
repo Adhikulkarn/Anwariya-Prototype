@@ -1,8 +1,6 @@
 from sqlalchemy.orm import Session
-import models
 from sqlalchemy import text
-import schemas 
-from datetime import datetime
+from schemas import BillCreate
 
 # --------------------
 # USERS
@@ -10,24 +8,25 @@ from datetime import datetime
 
 def create_or_get_user(db: Session, email: str, role: str):
     user = db.query(models.User).filter(models.User.email == email).first()
-
     if user:
         return user
-
     user = models.User(email=email, role=role)
     db.add(user)
     db.commit()
     db.refresh(user)
     return user
 
+def get_user_tokens(db: Session, user_id: int):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    return user.tokens if user else 0
 
-def get_user_by_id(db: Session, user_id: int):
-    return db.query(models.User).filter(models.User.id == user_id).first()
-
-
-# --------------------
-# CAMPAIGNS
-# --------------------
+def deduct_tokens(db: Session, user_id: int, amount: int):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user or user.tokens < amount:
+        return "INSUFFICIENT"
+    user.tokens -= amount
+    db.commit()
+    return user.tokens
 
 def create_campaign(db: Session, vendor_id: int, product_name: str, description: str):
     campaign = models.Campaign(
@@ -44,53 +43,44 @@ def create_campaign(db: Session, vendor_id: int, product_name: str, description:
 def get_all_campaigns(db: Session):
     return db.query(models.Campaign).all()
 
+# --------------------
+# ANALYTICS → AI ADAPTER
+# --------------------
+
+def extract_ai_analytics(analytics: dict) -> dict:
+    sales = analytics.get("sales", [])
+    kpis = analytics.get("kpis", {})
+
+    total_revenue = kpis.get("total_revenue", 0)
+    total_units = kpis.get("total_units_sold", 0)
+
+    avg_order_value = total_revenue / total_units if total_units else 0
+
+    top_products = sorted(sales, key=lambda x: x["quantity"], reverse=True)[:3]
+    low_products = sorted(sales, key=lambda x: x["quantity"])[:3]
+
+    return {
+        "revenue": {
+            "total": total_revenue
+        },
+        "orders": {
+            "total": total_units,
+            "average_order_value": round(avg_order_value, 2)
+        },
+        "products": {
+            "top": top_products,
+            "low": low_products
+        }
+    }
+
+def validate_ai_analytics(data: dict):
+    if data["orders"]["total"] == 0:
+        raise HTTPException(status_code=400, detail="No sales data for AI insights")
+    if data["revenue"]["total"] < 1000:
+        raise HTTPException(status_code=400, detail="Revenue too low for AI insights")
 
 # --------------------
-# CHATS
-# --------------------
-
-def create_or_get_chat(
-    db: Session,
-    campaign_id: int,
-    vendor_id: int,
-    influencer_id: int
-):
-    chat = (
-        db.query(models.Chat)
-        .filter(
-            models.Chat.campaign_id == campaign_id,
-            models.Chat.vendor_id == vendor_id,
-            models.Chat.influencer_id == influencer_id
-        )
-        .first()
-    )
-
-    if not chat:
-        chat = models.Chat(
-            campaign_id=campaign_id,
-            vendor_id=vendor_id,
-            influencer_id=influencer_id
-        )
-        db.add(chat)
-        db.commit()
-        db.refresh(chat)
-
-    return chat
-
-
-def get_chats_by_user(db: Session, user_id: int):
-    return (
-        db.query(models.Chat)
-        .filter(
-            (models.Chat.vendor_id == user_id) |
-            (models.Chat.influencer_id == user_id)
-        )
-        .all()
-    )
-
-
-# --------------------
-# MESSAGES
+# GEMINI AI
 # --------------------
 
 def create_message(db: Session, chat_id: int, sender_id: int, text: str):
@@ -206,41 +196,38 @@ def get_products(db: Session, vendor_id: int):
 
 
 # -------- BILLS --------
-def create_bill(db: Session, bill: schemas.BillCreate):
+def create_bill(db: Session, bill):
     product = db.query(models.Product).filter(
-        models.Product.id == bill.product_id
+        models.Product.id == bill.product_id,
+        models.Product.vendor_id == bill.vendor_id
     ).first()
 
     if not product:
-        raise ValueError("Product not found")
+        raise HTTPException(status_code=404, detail="Product not found")
 
     if product.quantity_available < bill.quantity:
-        raise ValueError("Insufficient stock")
+        raise HTTPException(status_code=400, detail="Insufficient stock")
 
-    total = bill.quantity * bill.selling_price
-    cost = bill.quantity * product.cost_price
-    profit = total - cost
+    # 🔑 CORE LOGIC
+    cost_price = product.cost_price           # PER UNIT
+    selling_price = bill.selling_price        # PER UNIT
 
-    # Deduct stock
-    product.quantity_available -= bill.quantity
+    profit_per_unit = selling_price - cost_price
+    total_profit = profit_per_unit * bill.quantity
 
     new_bill = models.Bill(
         vendor_id=bill.vendor_id,
         product_id=bill.product_id,
-        customer_name=bill.customer_name,
-        customer_email=bill.customer_email,
         quantity=bill.quantity,
-        selling_price=bill.selling_price,
+        selling_price=selling_price,
+        cost_price=cost_price,
+        profit=total_profit
     )
+
+    product.quantity_available -= bill.quantity
 
     db.add(new_bill)
     db.commit()
     db.refresh(new_bill)
 
-    return {
-        "bill_id": new_bill.id,
-        "total": total,
-        "profit": profit,
-        "product": product.product_name,
-        "date": new_bill.created_at,
-    }
+    return new_bill
